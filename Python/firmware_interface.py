@@ -1,97 +1,220 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
+import threading, queue, time
 import serial
-import threading
+from serial.tools import list_ports
 
-# Define serial port settings
-SERIAL_PORT = 'COM13'  # Replace with your actual port
-BAUD_RATE = 9600
+BAUD = 115200
 
-# Serial connection object
 ser = None
+rx_q = queue.Queue()
+tx_q = queue.Queue()
+stop_event = threading.Event()
+handshake_ok = False
 
-# Try to connect serial
-def connect_serial():
+def discover_ports():
+    return list_ports.comports()
+
+def open_serial(port):
+    global ser, handshake_ok
+    close_serial()
+    try:
+        ser = serial.Serial(port, BAUD, timeout=0.2, write_timeout=0.2)
+        # Pro Micro often waits for DTR; assert it
+        ser.setDTR(True)
+        ser.setRTS(True)
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        handshake_ok = False
+        return True
+    except Exception as e:
+        ser = None
+        messagebox.showerror("Serial", f"Failed to open {port}:\n{e}")
+        return False
+
+def close_serial():
     global ser
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    except Exception as e:
-        print(f"Error connecting to serial: {e}")
+        if ser and ser.is_open:
+            ser.close()
+    except:
+        pass
+    ser = None
 
-# Send data to Arduino
-def send_command(cmd):
-    if ser and ser.is_open:
-        ser.write(f"{cmd}\n".encode())
+def reader():
+    global handshake_ok
+    buf = b""
+    while not stop_event.is_set():
+        try:
+            if ser and ser.is_open:
+                n = ser.in_waiting
+                if n:
+                    buf += ser.read(n)
+                    while b"\n" in buf:
+                        line, _, buf = buf.partition(b"\n")
+                        text = line.decode(errors="ignore").strip()
+                        if text == "READY":
+                            handshake_ok = True
+                            rx_q.put(("status", "READY"))
+                        elif text.startswith("STATE "):
+                            rx_q.put(("state", text[6:]))
+                        else:
+                            rx_q.put(("log", text))
+                else:
+                    time.sleep(0.01)
+            else:
+                time.sleep(0.05)
+        except Exception as e:
+            rx_q.put(("log", f"Serial read error: {e}"))
+            time.sleep(0.2)
 
-# Thread-safe temperature update
-def read_serial():
-    while True:
-        if ser and ser.in_waiting:
-            try:
-                line = ser.readline().decode().strip()
-                if line.startswith("TEMP(C):"):
-                    temp = line.split(":")[1].strip()
-                    temp_var.set(temp)
-            except:
-                pass
+def writer():
+    global handshake_ok
+    last_motor = None
+    while not stop_event.is_set():
+        try:
+            kind, payload = tx_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if not (ser and ser.is_open):
+            continue
+        try:
+            # Coalesce motor commands (keep only the newest)
+            if kind == "motor":
+                last_motor = payload
+                # drain any queued motors
+                try:
+                    while True:
+                        k2, p2 = tx_q.get_nowait()
+                        if k2 == "motor":
+                            last_motor = p2
+                        else:
+                            # send deferred motor after we send this non-motor
+                            if last_motor is not None:
+                                ser.write(f"MOTOR:{last_motor}\n".encode())
+                                last_motor = None
+                            ser.write((p2 + "\n").encode())
+                except queue.Empty:
+                    pass
+                if last_motor is not None:
+                    ser.write(f"MOTOR:{last_motor}\n".encode())
+                    last_motor = None
+            else:
+                ser.write((payload + "\n").encode())
+        except serial.SerialTimeoutException:
+            rx_q.put(("log", "Write timeout"))
+            time.sleep(0.05)
+        except Exception as e:
+            rx_q.put(("log", f"Serial write error: {e}"))
 
-# Create GUI window
+# ----------------- GUI -----------------
 root = tk.Tk()
-root.title("Thermal & Motor Control Interface")
+root.title("Thermal & Motor Control")
 
-# Temperature display
-temp_frame = ttk.LabelFrame(root, text="Temperature Sensor")
-temp_frame.pack(fill="x", padx=10, pady=5)
+# Top: port selection
+top = ttk.Frame(root); top.pack(fill="x", padx=10, pady=8)
+ttk.Label(top, text="Port:").pack(side="left")
+port_cmb = ttk.Combobox(top, state="readonly", width=35)
+def refresh_ports():
+    items = []
+    for p in discover_ports():
+        items.append(f"{p.device} — {p.description}")
+    port_cmb["values"] = items
+    if items:
+        port_cmb.current(0)
+refresh_btn = ttk.Button(top, text="Refresh", command=refresh_ports)
+connect_btn = ttk.Button(top, text="Connect", command=lambda: do_connect())
+port_cmb.pack(side="left", padx=5)
+refresh_btn.pack(side="left", padx=5)
+connect_btn.pack(side="left", padx=5)
 
-temp_var = tk.StringVar(value="N/A")
-ttk.Label(temp_frame, text="Temperature (°C):").pack(side="left", padx=5)
-ttk.Label(temp_frame, textvariable=temp_var, font=("Arial", 12)).pack(side="left")
+status_var = tk.StringVar(value="Disconnected")
+ttk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", padx=10)
 
-# Heater control
-heater_frame = ttk.LabelFrame(root, text="Heater Control")
-heater_frame.pack(fill="x", padx=10, pady=5)
+# Temps
+temps = ttk.LabelFrame(root, text="Temperatures (°C)"); temps.pack(fill="x", padx=10, pady=8)
+t0_var = tk.StringVar(value="—"); t1_var = tk.StringVar(value="—"); t2_var = tk.StringVar(value="—"); tds_var = tk.StringVar(value="—")
+row = ttk.Frame(temps); row.pack(fill="x", padx=6, pady=6)
+for lbl, var in (("A0", t0_var), ("A1", t1_var), ("A2", t2_var), ("DS18B20", tds_var)):
+    frame = ttk.Frame(row); frame.pack(side="left", padx=10)
+    ttk.Label(frame, text=lbl).pack()
+    ttk.Label(frame, textvariable=var, font=("Arial", 12)).pack()
 
-def toggle_heater():
-    if heater_btn.config('text')[-1] == 'Turn ON':
-        send_command("HEATER_ON")
-        heater_btn.config(text='Turn OFF')
+# Controls
+ctrl = ttk.LabelFrame(root, text="Controls"); ctrl.pack(fill="x", padx=10, pady=6)
+
+def send_cmd(txt): tx_q.put(("raw", txt))
+def set_motor(v):
+    try: val = int(float(v))
+    except: return
+    tx_q.put(("motor", val))
+
+psu_btn = ttk.Button(ctrl, text="PSU ON", command=lambda: send_cmd("PSU_ON"))
+psu_off = ttk.Button(ctrl, text="PSU OFF", command=lambda: send_cmd("PSU_OFF"))
+heat_on = ttk.Button(ctrl, text="HEATER ON", command=lambda: send_cmd("HEATER_ON"))
+heat_off= ttk.Button(ctrl, text="HEATER OFF", command=lambda: send_cmd("HEATER_OFF"))
+for b in (psu_btn, psu_off, heat_on, heat_off):
+    b.pack(side="left", padx=6, pady=6)
+
+motor_frame = ttk.Frame(ctrl); motor_frame.pack(fill="x", padx=6, pady=6)
+ttk.Label(motor_frame, text="Motor PWM").pack(side="left")
+motor_scale = ttk.Scale(motor_frame, from_=0, to=255, orient="horizontal", command=set_motor)
+motor_scale.set(0)
+motor_scale.pack(side="left", fill="x", expand=True, padx=8)
+
+beep_btn = ttk.Button(ctrl, text="Beep 200 ms", command=lambda: send_cmd("BEEP:200"))
+beep_btn.pack(side="left", padx=6)
+
+# Log
+log = tk.Text(root, height=8, state="disabled"); log.pack(fill="both", expand=True, padx=10, pady=8)
+
+def log_print(s):
+    log.configure(state="normal")
+    log.insert("end", s + "\n")
+    log.see("end")
+    log.configure(state="disabled")
+
+def do_connect():
+    sel = port_cmb.get().split(" — ")[0] if port_cmb.get() else ""
+    if not sel:
+        messagebox.showwarning("Serial", "Pick a port first.")
+        return
+    if open_serial(sel):
+        status_var.set(f"Connected {sel} @ {BAUD}, waiting for READY…")
+        log_print(f"[INFO] Opened {sel}")
     else:
-        send_command("HEATER_OFF")
-        heater_btn.config(text='Turn ON')
+        status_var.set("Disconnected")
 
-heater_btn = ttk.Button(heater_frame, text="Turn ON", command=toggle_heater)
-heater_btn.pack(padx=10, pady=5)
-
-# Motor speed control (Speaker PWM)
-motor_frame = ttk.LabelFrame(root, text="Speaker PWM Control")
-motor_frame.pack(fill="x", padx=10, pady=5)
-
-def set_motor_speed(val):
-    send_command(f"MOTOR:{val}")
-
-speed_scale = ttk.Scale(motor_frame, from_=0, to=255, orient="horizontal", command=lambda v: set_motor_speed(int(float(v))))
-speed_scale.set(0)
-speed_scale.pack(fill="x", padx=10)
-
-# Stepper motor control
-stepper_frame = ttk.LabelFrame(root, text="Stepper Motor Control")
-stepper_frame.pack(fill="x", padx=10, pady=5)
-
-def send_steps():
+# UI poller for rx_q
+def tick():
     try:
-        count = int(step_entry.get())
-        send_command(f"STEP:{count}")
-    except ValueError:
-        print("Invalid step count")
+        while True:
+            kind, payload = rx_q.get_nowait()
+            if kind == "status" and payload == "READY":
+                status_var.set("Device READY")
+                log_print("[INFO] READY")
+            elif kind == "state":
+                # payload like: "HEATER:0 PSU:1 MOTOR:128 T0:25.1 T1:24.9 T2:24.8 TDS:25.0"
+                parts = dict(p.split(":") for p in payload.split())
+                t0_var.set(parts.get("T0", "—"))
+                t1_var.set(parts.get("T1", "—"))
+                t2_var.set(parts.get("T2", "—"))
+                tds_var.set(parts.get("TDS", "—"))
+            elif kind == "log":
+                log_print(payload)
+    except queue.Empty:
+        pass
+    root.after(50, tick)
 
-step_entry = ttk.Entry(stepper_frame, width=10)
-step_entry.insert(0, "100")  # default
-step_entry.pack(side="left", padx=5)
+def on_close():
+    stop_event.set()
+    root.after(150, lambda: (close_serial(), root.destroy()))
 
-step_btn = ttk.Button(stepper_frame, text="Send Steps", command=send_steps)
-step_btn.pack(side="left", padx=5)
+root.protocol("WM_DELETE_WINDOW", on_close)
 
-# Start everything
-connect_serial()
-threading.Thread(target=read_serial, daemon=True).start()
+# Start threads
+threading.Thread(target=reader, daemon=True).start()
+threading.Thread(target=writer, daemon=True).start()
+refresh_ports()
+tick()
 root.mainloop()
