@@ -2,7 +2,7 @@
 
 // ==== Pin map ====
 const int PIN_SSR      = 5;   // Heater SSR
-const int PIN_PSU_EN   = 8;   // ATX power-on (green wire)
+const int PIN_PSU_EN   = 8;   // Drives NPN base (via ~10k) for ATX PS_ON# (green)
 const int PIN_MOTOR    = 10;  // Motor PWM
 const int PIN_FAN      = 9;   // Fan PWM (can also double as speaker)
 const int PIN_SPEAKER  = 7;   // Speaker (shares pin with FAN if you only need beep)
@@ -19,7 +19,6 @@ bool psuOn    = false;
 int motorPwm  = 0;
 int fanPwm    = 0;
 
-// Line buffer
 String rxLine;
 
 void setup() {
@@ -27,27 +26,43 @@ void setup() {
   while (!Serial) { ; }
 
   pinMode(PIN_SSR, OUTPUT);
-  pinMode(PIN_PSU_EN, OUTPUT);
   pinMode(PIN_MOTOR, OUTPUT);
   pinMode(PIN_FAN, OUTPUT);
 
-  digitalWrite(PIN_SSR, LOW);
-  digitalWrite(PIN_PSU_EN, HIGH); // ATX "PWR-ON" is active low; HIGH keeps PSU off initially
+  // IMPORTANT WIRING NOTES:
+  // - Arduino GND must tie to PSU GND (black).
+  // - Power Arduino from USB or +5VSB (purple), so it stays alive during PSU on/off.
+  // - D8 -> 10k -> NPN base, NPN emitter -> GND, NPN collector -> PS_ON# (green).
+  // Start with PSU OFF: no base drive (hi-Z).
+  pinMode(PIN_PSU_EN, INPUT);
 
+  digitalWrite(PIN_SSR, LOW);
   analogWrite(PIN_MOTOR, 0);
   analogWrite(PIN_FAN, 0);
 
   Serial.println("READY");
 }
 
+// =======================
+// ==== Core Controls ====
+// =======================
+
 void setHeater(bool on) {
   heaterOn = on;
   digitalWrite(PIN_SSR, on ? HIGH : LOW);
 }
 
+// ATX PS_ON# via NPN:
+//  - ON  -> drive base HIGH (OUTPUT, HIGH) to sink PS_ON# to GND.
+//  - OFF -> stop base drive (INPUT or OUTPUT, LOW). We'll use INPUT (hi-Z) for safety.
 void setPSU(bool on) {
   psuOn = on;
-  digitalWrite(PIN_PSU_EN, on ? LOW : HIGH); // Active low
+  if (on) {
+    pinMode(PIN_PSU_EN, OUTPUT);
+    digitalWrite(PIN_PSU_EN, HIGH);   // base drive -> transistor sinks PS_ON# -> PSU ON
+  } else {
+    pinMode(PIN_PSU_EN, INPUT);       // hi-Z -> no base drive -> PS_ON# floats HIGH -> PSU OFF
+  }
 }
 
 void setMotor(int pwm) {
@@ -66,7 +81,10 @@ void beep(int ms, int freq = 2000) {
   noTone(PIN_SPEAKER);
 }
 
-// Read line from Serial
+// ===========================
+// ==== Serial Line Reader ====
+// ===========================
+
 bool readLine(String &out) {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -80,6 +98,10 @@ bool readLine(String &out) {
   }
   return false;
 }
+
+// ===========================
+// ==== Command Handling =====
+// ===========================
 
 void handleCommand(const String &cmd) {
   if (cmd == "HEATER_ON")      { setHeater(true);  Serial.println("ACK HEATER=ON"); }
@@ -102,6 +124,10 @@ void handleCommand(const String &cmd) {
     Serial.println("PONG");
   }
 }
+
+// ===========================
+// ==== Telemetry Loop =======
+// ===========================
 
 unsigned long lastTelem = 0;
 

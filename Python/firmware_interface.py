@@ -132,10 +132,14 @@ status_var = tk.StringVar(value="Disconnected")
 ttk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", padx=10)
 
 # Temps
-temps = ttk.LabelFrame(root, text="Temperatures (°C)"); temps.pack(fill="x", padx=10, pady=8)
-t0_var = tk.StringVar(value="—"); t1_var = tk.StringVar(value="—"); t2_var = tk.StringVar(value="—"); tds_var = tk.StringVar(value="—")
-row = ttk.Frame(temps); row.pack(fill="x", padx=6, pady=6)
-for lbl, var in (("A0", t0_var), ("A1", t1_var), ("A2", t2_var), ("DS18B20", tds_var)):
+telemetry = ttk.LabelFrame(root, text="Telemetry"); telemetry.pack(fill="x", padx=10, pady=8)
+heater_var = tk.StringVar(value="—")
+psu_var = tk.StringVar(value="—")
+motor_val_var = tk.StringVar(value="—")
+fan_val_var = tk.StringVar(value="—")
+temp_var = tk.StringVar(value="—")
+row = ttk.Frame(telemetry); row.pack(fill="x", padx=6, pady=6)
+for lbl, var in (("Heater", heater_var), ("PSU", psu_var), ("Motor", motor_val_var), ("Fan", fan_val_var), ("Temp °C", temp_var)):
     frame = ttk.Frame(row); frame.pack(side="left", padx=10)
     ttk.Label(frame, text=lbl).pack()
     ttk.Label(frame, textvariable=var, font=("Arial", 12)).pack()
@@ -145,9 +149,18 @@ ctrl = ttk.LabelFrame(root, text="Controls"); ctrl.pack(fill="x", padx=10, pady=
 
 def send_cmd(txt): tx_q.put(("raw", txt))
 def set_motor(v):
-    try: val = int(float(v))
-    except: return
+    try:
+        val = int(float(v))
+    except:
+        return
     tx_q.put(("motor", val))
+
+def set_fan(v):
+    try:
+        val = int(float(v))
+    except:
+        return
+    tx_q.put(("raw", f"FAN:{val}"))
 
 psu_btn = ttk.Button(ctrl, text="PSU ON", command=lambda: send_cmd("PSU_ON"))
 psu_off = ttk.Button(ctrl, text="PSU OFF", command=lambda: send_cmd("PSU_OFF"))
@@ -161,6 +174,12 @@ ttk.Label(motor_frame, text="Motor PWM").pack(side="left")
 motor_scale = ttk.Scale(motor_frame, from_=0, to=255, orient="horizontal", command=set_motor)
 motor_scale.set(0)
 motor_scale.pack(side="left", fill="x", expand=True, padx=8)
+
+fan_frame = ttk.Frame(ctrl); fan_frame.pack(fill="x", padx=6, pady=6)
+ttk.Label(fan_frame, text="Fan PWM").pack(side="left")
+fan_scale = ttk.Scale(fan_frame, from_=0, to=255, orient="horizontal", command=set_fan)
+fan_scale.set(0)
+fan_scale.pack(side="left", fill="x", expand=True, padx=8)
 
 beep_btn = ttk.Button(ctrl, text="Beep 200 ms", command=lambda: send_cmd("BEEP:200"))
 beep_btn.pack(side="left", padx=6)
@@ -194,12 +213,32 @@ def tick():
                 status_var.set("Device READY")
                 log_print("[INFO] READY")
             elif kind == "state":
-                # payload like: "HEATER:0 PSU:1 MOTOR:128 T0:25.1 T1:24.9 T2:24.8 TDS:25.0"
-                parts = dict(p.split(":") for p in payload.split())
-                t0_var.set(parts.get("T0", "—"))
-                t1_var.set(parts.get("T1", "—"))
-                t2_var.set(parts.get("T2", "—"))
-                tds_var.set(parts.get("TDS", "—"))
+                # payload like: "HEATER:1 PSU:1 MOTOR:128 FAN:64 TEMP:25.34"
+                parts = dict(p.split(":", 1) for p in payload.split())
+                heater = parts.get("HEATER")
+                psu = parts.get("PSU")
+                motor_val = parts.get("MOTOR")
+                fan_val = parts.get("FAN")
+                temp = parts.get("TEMP")
+
+                heater_var.set("ON" if heater == "1" else "OFF" if heater is not None else "—")
+                psu_var.set("ON" if psu == "1" else "OFF" if psu is not None else "—")
+                if motor_val is not None:
+                    motor_val_var.set(motor_val)
+                else:
+                    motor_val_var.set("—")
+                if fan_val is not None:
+                    fan_val_var.set(fan_val)
+                else:
+                    fan_val_var.set("—")
+                if temp is not None:
+                    try:
+                        temp_float = float(temp)
+                        temp_var.set(f"{temp_float:.2f}")
+                    except ValueError:
+                        temp_var.set(temp)
+                else:
+                    temp_var.set("—")
             elif kind == "log":
                 log_print(payload)
     except queue.Empty:
